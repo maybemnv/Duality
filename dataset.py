@@ -80,6 +80,9 @@ def get_train_transform():
             rotate_limit=AUG_RANDOM_ROTATION["degrees"],
             p=AUG_RANDOM_ROTATION["p"]
         ),
+        # Rare-class augmentations
+        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.3),
+        A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.3),
         A.Normalize(
             mean=IMAGENET_MEAN,
             std=IMAGENET_STD
@@ -209,6 +212,39 @@ class SegmentationDataset(Dataset):
         return image, mask, image_id
 
 
+def build_rare_class_sampler(
+    dataset: Dataset,
+    rare_class_ids: list = None,
+    rare_boost: float = 3.0,
+) -> torch.utils.data.WeightedRandomSampler:
+    """
+    Build a WeightedRandomSampler that oversamples images containing rare classes.
+
+    Args:
+        dataset: SegmentationDataset instance
+        rare_class_ids: Remapped class IDs to boost (default: Logs=6, Flowers=5, Ground Clutter=4)
+        rare_boost: Multiplier applied to images containing any rare class
+
+    Returns:
+        WeightedRandomSampler
+    """
+    if rare_class_ids is None:
+        rare_class_ids = {4, 5, 6}  # Ground Clutter, Flowers, Logs
+
+    weights = []
+    for idx in range(len(dataset)):
+        _, mask, _ = dataset[idx]
+        mask_np = mask.numpy() if isinstance(mask, torch.Tensor) else np.array(mask)
+        has_rare = any((mask_np == c).any() for c in rare_class_ids)
+        weights.append(rare_boost if has_rare else 1.0)
+
+    return torch.utils.data.WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),
+        replacement=True,
+    )
+
+
 def compute_class_weights(dataloader: DataLoader, num_classes: int = NUM_CLASSES) -> torch.Tensor:
     """
     Compute class weights from training set pixel frequencies.
@@ -242,58 +278,56 @@ def create_dataloaders(
     train_dir: str,
     val_dir: str,
     batch_size: int = 8,
-    num_workers: int = 4
+    num_workers: int = 4,
+    use_rare_sampler: bool = True,
 ):
     """
     Create training and validation DataLoaders.
-    
+
     Args:
         train_dir: Path to training dataset directory
         val_dir: Path to validation dataset directory
         batch_size: Batch size for training
         num_workers: Number of data loading workers
-        
+        use_rare_sampler: Oversample images with rare classes via WeightedRandomSampler
+
     Returns:
         train_loader, val_loader, class_weights
     """
-    # Create datasets
-    train_dataset = SegmentationDataset(
-        train_dir,
-        transform=get_train_transform(),
-        is_test=False
-    )
-    
-    val_dataset = SegmentationDataset(
-        val_dir,
-        transform=get_val_transform(),
-        is_test=False
-    )
-    
-    # Create dataloaders
+    train_dataset = SegmentationDataset(train_dir, transform=get_train_transform())
+    val_dataset = SegmentationDataset(val_dir, transform=get_val_transform())
+
+    sampler = None
+    shuffle = True
+    if use_rare_sampler:
+        print("Building rare-class sampler (Logs, Flowers, Ground Clutter)...")
+        sampler = build_rare_class_sampler(train_dataset)
+        shuffle = False  # mutually exclusive with sampler
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
     )
-    
-    # Compute class weights from training data
+
     class_weights = compute_class_weights(train_loader, num_classes=NUM_CLASSES)
-    
+
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
     print(f"Class weights: {class_weights}")
-    
+
     return train_loader, val_loader, class_weights
 
 
