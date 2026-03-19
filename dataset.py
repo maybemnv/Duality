@@ -1,6 +1,15 @@
 """
 Custom Dataset class for Duality AI Offroad Segmentation Challenge
-Handles loading, class ID remapping, and augmentations
+PRD Version: SegFormer-B2 | RTX 3070 Laptop 8GB VRAM
+
+Handles loading, class ID remapping, and augmentations per PRD specification.
+
+Critical: Class ID Remapping
+PyTorch CrossEntropyLoss requires class labels in range [0, N-1].
+The provided mask IDs are non-sequential (100, 200 ... 10000).
+Remapping is mandatory — training will silently produce garbage outputs without it.
+
+Stack: Python · PyTorch · HuggingFace Transformers · albumentations · Conda
 """
 
 import os
@@ -8,27 +17,39 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from PIL import Image
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 
 from config import (
     ORIGINAL_ID_MAP,
     NUM_CLASSES,
     IMAGE_SIZE,
-    AUG_COLOR_JITTER,
-    AUG_HORIZONTAL_FLIP,
-    AUG_RANDOM_RESIZED_CROP,
-    AUG_GAUSSIAN_BLUR,
-    AUG_RANDOM_GRAYSCALE,
-    AUG_RANDOM_ROTATION,
-    IMAGENET_MEAN,
-    IMAGENET_STD,
+    BATCH_SIZE,
+    NUM_WORKERS,
+    PIN_MEMORY,
+    TRAIN_DIR,
+    VAL_DIR,
+    TEST_DIR,
 )
+from augmentations import get_train_transform, get_val_transform, get_test_transform
 
 
 def remap_mask(mask: np.ndarray) -> np.ndarray:
     """
     Convert raw mask pixel values to sequential class IDs [0, N-1].
+    
+    PRD Class Mapping:
+        100      → 0   (Trees)
+        200      → 1   (Lush Bushes)
+        300      → 2   (Dry Grass)
+        500      → 3   (Dry Bushes)
+        550      → 4   (Ground Clutter)
+        600      → 5   (Flowers)
+        700      → 6   (Logs)
+        800      → 7   (Rocks)
+        7100     → 8   (Landscape)
+        10000    → 9   (Sky)
+    
+    Verification step: After applying remapping, visualize 5 random masks
+    and confirm labels match visible class boundaries before training.
     
     Args:
         mask: Raw mask as numpy array with original class IDs
@@ -42,99 +63,18 @@ def remap_mask(mask: np.ndarray) -> np.ndarray:
     return remapped
 
 
-def get_train_transform():
-    """
-    Get training augmentation pipeline.
-    
-    Includes:
-    - RandomResizedCrop for multi-scale training
-    - HorizontalFlip for invariance
-    - ColorJitter for lighting robustness
-    - GaussianBlur for sim-to-real gap
-    - RandomGrayscale for color invariance
-    - RandomRotation for angle robustness
-    - Normalization for pretrained backbone
-    """
-    return A.Compose([
-        A.RandomResizedCrop(
-            height=IMAGE_SIZE[0],
-            width=IMAGE_SIZE[1],
-            scale=AUG_RANDOM_RESIZED_CROP["scale"],
-            p=1.0
-        ),
-        A.HorizontalFlip(p=AUG_HORIZONTAL_FLIP["p"]),
-        A.ColorJitter(
-            brightness=AUG_COLOR_JITTER["brightness"],
-            contrast=AUG_COLOR_JITTER["contrast"],
-            hue=AUG_COLOR_JITTER["hue"],
-            p=AUG_COLOR_JITTER["p"]
-        ),
-        A.GaussianBlur(
-            blur_limit=AUG_GAUSSIAN_BLUR["blur_limit"],
-            p=AUG_GAUSSIAN_BLUR["p"]
-        ),
-        A.RandomGrayscale(p=AUG_RANDOM_GRAYSCALE["p"]),
-        A.ShiftScaleRotate(
-            shift_limit=0.1,
-            scale_limit=0.1,
-            rotate_limit=AUG_RANDOM_ROTATION["degrees"],
-            p=AUG_RANDOM_ROTATION["p"]
-        ),
-        # Rare-class augmentations
-        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.3),
-        A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.3),
-        A.Normalize(
-            mean=IMAGENET_MEAN,
-            std=IMAGENET_STD
-        ),
-        ToTensorV2(),
-    ], additional_targets={"mask": "mask"})
-
-
-def get_val_transform():
-    """
-    Get validation/test augmentation pipeline.
-    
-    Only includes:
-    - Resize to fixed size
-    - Normalization for pretrained backbone
-    """
-    return A.Compose([
-        A.Resize(height=IMAGE_SIZE[0], width=IMAGE_SIZE[1]),
-        A.Normalize(
-            mean=IMAGENET_MEAN,
-            std=IMAGENET_STD
-        ),
-        ToTensorV2(),
-    ], additional_targets={"mask": "mask"})
-
-
-def get_test_transform():
-    """
-    Get test augmentation pipeline (no mask).
-    """
-    return A.Compose([
-        A.Resize(height=IMAGE_SIZE[0], width=IMAGE_SIZE[1]),
-        A.Normalize(
-            mean=IMAGENET_MEAN,
-            std=IMAGENET_STD
-        ),
-        ToTensorV2(),
-    ])
-
-
 class SegmentationDataset(Dataset):
     """
     PyTorch Dataset for offroad semantic segmentation.
     
-    Expects directory structure:
+    Expects directory structure (PRD-specified):
         data_dir/
         ├── Color_Images/
-        │   ├── image1.png
-        │   └── image2.png
+        │   ├── image_001.png
+        │   └── ...
         └── Segmentation/
-            ├── image1.png
-            └── image2.png
+            ├── image_001.png
+            └── ...
     """
     
     def __init__(self, data_dir: str, transform=None, is_test: bool = False):
@@ -164,12 +104,6 @@ class SegmentationDataset(Dataset):
             os.path.splitext(f)[1].lower() in self.image_extensions
         ])
         
-        # Filter out non-image files
-        self.image_files = [
-            f for f in self.image_files
-            if os.path.splitext(f)[1].lower() in self.image_extensions
-        ]
-        
     def __len__(self) -> int:
         return len(self.image_files)
     
@@ -181,7 +115,7 @@ class SegmentationDataset(Dataset):
         image = np.array(Image.open(image_path).convert("RGB"))
         
         if self.is_test:
-            # Test mode: only return image
+            # Test mode: only return image (testImages has no masks)
             if self.transform:
                 transformed = self.transform(image=image)
                 image = transformed["image"]
@@ -200,7 +134,7 @@ class SegmentationDataset(Dataset):
         
         mask = np.array(Image.open(mask_path))
         
-        # Remap mask values to [0, N-1]
+        # CRITICAL: Remap mask values to [0, N-1]
         mask = remap_mask(mask)
         
         # Apply transforms
@@ -212,45 +146,27 @@ class SegmentationDataset(Dataset):
         return image, mask, image_id
 
 
-def build_rare_class_sampler(
-    dataset: Dataset,
-    rare_class_ids: list = None,
-    rare_boost: float = 3.0,
-) -> torch.utils.data.WeightedRandomSampler:
-    """
-    Build a WeightedRandomSampler that oversamples images containing rare classes.
-
-    Args:
-        dataset: SegmentationDataset instance
-        rare_class_ids: Remapped class IDs to boost (default: Logs=6, Flowers=5, Ground Clutter=4)
-        rare_boost: Multiplier applied to images containing any rare class
-
-    Returns:
-        WeightedRandomSampler
-    """
-    if rare_class_ids is None:
-        rare_class_ids = {4, 5, 6}  # Ground Clutter, Flowers, Logs
-
-    weights = []
-    for idx in range(len(dataset)):
-        _, mask, _ = dataset[idx]
-        mask_np = mask.numpy() if isinstance(mask, torch.Tensor) else np.array(mask)
-        has_rare = any((mask_np == c).any() for c in rare_class_ids)
-        weights.append(rare_boost if has_rare else 1.0)
-
-    return torch.utils.data.WeightedRandomSampler(
-        weights=weights,
-        num_samples=len(weights),
-        replacement=True,
-    )
-
-
 def compute_class_weights(dataloader: DataLoader, num_classes: int = NUM_CLASSES) -> torch.Tensor:
     """
     Compute class weights from training set pixel frequencies.
     
-    Uses inverse frequency weighting to handle class imbalance.
-    Rare classes (Logs, Flowers, Ground Clutter) get higher weights.
+    PRD: The imbalance problem
+    Landscape (class 8) and Sky (class 9) dominate pixel counts.
+    Logs (class 6), Flowers (class 5), and Ground Clutter (class 4)
+    appear in very few pixels. A naive CrossEntropyLoss optimizes for
+    majority classes and ignores rare ones, producing IoU = 0.
+    
+    Since mean IoU averages all 10 classes equally, a class with IoU = 0
+    heavily penalizes the score.
+    
+    Solution: weighted CrossEntropyLoss
+    1. Count pixel frequency per class across entire training set
+    2. Invert frequencies: rare class → high weight, dominant class → low weight
+    3. Normalize weights so they sum to num_classes
+    
+    Computed weight formula:
+        weight[c] = 1 / (pixel_count[c] + epsilon)
+        weight    = weight / weight.sum() * num_classes
     
     Args:
         dataloader: DataLoader with training dataset
@@ -265,7 +181,7 @@ def compute_class_weights(dataloader: DataLoader, num_classes: int = NUM_CLASSES
         for c in range(num_classes):
             counts[c] += (masks == c).sum()
     
-    # Add small epsilon to avoid division by zero
+    # Add epsilon to avoid division by zero
     weights = 1.0 / (counts + 1e-6)
     
     # Normalize weights
@@ -275,74 +191,99 @@ def compute_class_weights(dataloader: DataLoader, num_classes: int = NUM_CLASSES
 
 
 def create_dataloaders(
-    train_dir: str,
-    val_dir: str,
-    batch_size: int = 8,
-    num_workers: int = 4,
-    use_rare_sampler: bool = True,
+    train_dir: str = TRAIN_DIR,
+    val_dir: str = VAL_DIR,
+    batch_size: int = BATCH_SIZE,
+    num_workers: int = NUM_WORKERS,
+    pin_memory: bool = PIN_MEMORY,
 ):
     """
     Create training and validation DataLoaders.
-
+    
+    PRD Hardware Configuration (RTX 3070 Laptop 8GB VRAM):
+    - BATCH_SIZE: 8 (safe ceiling with AMP enabled)
+    - NUM_WORKERS: 4 (comfortable for 16GB system RAM)
+    - PIN_MEMORY: True (faster CPU to GPU transfer)
+    
     Args:
         train_dir: Path to training dataset directory
         val_dir: Path to validation dataset directory
         batch_size: Batch size for training
         num_workers: Number of data loading workers
-        use_rare_sampler: Oversample images with rare classes via WeightedRandomSampler
-
+        pin_memory: Pin memory for faster transfer
+        
     Returns:
         train_loader, val_loader, class_weights
     """
-    train_dataset = SegmentationDataset(train_dir, transform=get_train_transform())
-    val_dataset = SegmentationDataset(val_dir, transform=get_val_transform())
-
-    sampler = None
-    shuffle = True
-    if use_rare_sampler:
-        print("Building rare-class sampler (Logs, Flowers, Ground Clutter)...")
-        sampler = build_rare_class_sampler(train_dataset)
-        shuffle = False  # mutually exclusive with sampler
-
+    # Create datasets
+    train_dataset = SegmentationDataset(
+        train_dir,
+        transform=get_train_transform(),
+        is_test=False
+    )
+    
+    val_dataset = SegmentationDataset(
+        val_dir,
+        transform=get_val_transform(),
+        is_test=False
+    )
+    
+    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
+        shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=True,
+        persistent_workers=(num_workers > 0),
     )
-
+    
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
     )
-
+    
+    # Compute class weights from training data
     class_weights = compute_class_weights(train_loader, num_classes=NUM_CLASSES)
-
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
-    print(f"Class weights: {class_weights}")
-
+    
+    print(f"\nDataset Statistics:")
+    print(f"  Training samples: {len(train_dataset)}")
+    print(f"  Validation samples: {len(val_dataset)}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Num workers: {num_workers}")
+    print(f"\nClass Weights (for weighted CrossEntropyLoss):")
+    for i, (name, weight) in enumerate(zip(
+        ['Trees', 'Lush Bushes', 'Dry Grass', 'Dry Bushes', 'Ground Clutter',
+         'Flowers', 'Logs', 'Rocks', 'Landscape', 'Sky'],
+        class_weights.tolist()
+    )):
+        print(f"  {i}: {name:15} = {weight:.4f}")
+    
     return train_loader, val_loader, class_weights
 
 
 def create_test_dataloader(
-    test_dir: str,
-    batch_size: int = 8,
-    num_workers: int = 4
+    test_dir: str = TEST_DIR,
+    batch_size: int = BATCH_SIZE,
+    num_workers: int = NUM_WORKERS,
+    pin_memory: bool = PIN_MEMORY,
 ):
     """
     Create test DataLoader (no masks).
+    
+    PRD: testImages folder is strictly off-limits for training.
+    Only used for final inference after training is complete.
     
     Args:
         test_dir: Path to test dataset directory
         batch_size: Batch size
         num_workers: Number of data loading workers
+        pin_memory: Pin memory for faster transfer
         
     Returns:
         test_loader
@@ -358,9 +299,53 @@ def create_test_dataloader(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
     )
     
-    print(f"Test samples: {len(test_dataset)}")
+    print(f"\nTest Dataset:")
+    print(f"  Test samples: {len(test_dataset)}")
     
     return test_loader
+
+
+def verify_mask_remap(data_dir: str, num_samples: int = 5):
+    """
+    Verify mask remapping is correct before training.
+    
+    PRD Verification step: After applying remapping, visualize 5 random
+    masks and confirm labels match visible class boundaries.
+    
+    Args:
+        data_dir: Path to dataset directory
+        num_samples: Number of samples to verify
+    """
+    import matplotlib.pyplot as plt
+    from config import CLASS_NAMES, COLOR_PALETTE
+    
+    dataset = SegmentationDataset(data_dir, transform=None, is_test=False)
+    
+    if len(dataset) < num_samples:
+        num_samples = len(dataset)
+    
+    fig, axes = plt.subplots(1, num_samples, figsize=(20, 5))
+    if num_samples == 1:
+        axes = [axes]
+    
+    for i, ax in enumerate(axes):
+        _, mask, image_id = dataset[i]
+        
+        # Create color visualization
+        color_mask = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+        for class_id, color in enumerate(COLOR_PALETTE):
+            color_mask[mask == class_id] = color
+        
+        ax.imshow(color_mask)
+        ax.set_title(f"{image_id}\nClasses: {np.unique(mask)}")
+        ax.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('mask_verification.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved mask verification to mask_verification.png")
+    print("Verify that class boundaries match expected segmentation.")
